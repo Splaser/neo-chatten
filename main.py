@@ -234,6 +234,18 @@ async def async_main() -> int:
     # Initialize tools
     tools = setup_tools(config)
     
+    # --- Hackthon: Neo RPC health check ---
+    neo_bridge = tools["neo_bridge"]
+    connected = await neo_bridge.connect()
+    if not connected:
+        print("❌ Failed to connect Neo RPC node:", config["neo"]["rpc_url"])
+        return 1
+
+    height = await neo_bridge.get_block_height()
+    print(f"✅ Connected to Neo RPC @ {config['neo']['rpc_url']}")
+    print(f"   Current block height: {height}")
+    print()
+
     # Create agent
     agent = create_agent(config, tools)
     

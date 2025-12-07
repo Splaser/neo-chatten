@@ -4,6 +4,7 @@ Neo Bridge Tool
 Core SpoonOS tool for connecting agents to the Neo N3 blockchain.
 Handles RPC communication, transaction signing, and contract invocation.
 """
+import httpx
 
 from typing import Any, Optional
 from dataclasses import dataclass
@@ -109,27 +110,29 @@ class NeoBridgeTool(BaseTool):
     async def connect(self) -> bool:
         """
         Establish connection to Neo N3 RPC node.
-        
-        Returns:
-            bool: True if connection successful
         """
-        # TODO: Implement RPC connection
-        # self._client = NeoRpcClient(self.config.rpc_url)
-        # self._facade = ChainFacade(self._client)
-        # return await self._client.test_connection()
-        return False
+        try:
+            # 打一条 getblockcount 当作健康检查
+            result = await self._rpc_call("getblockcount")
+            # 如果没有异常，就认为连通
+            return isinstance(result, int) and result > 0
+        except Exception as e:
+            # 失败就清空 client，方便重试
+            self._client = None
+            print(f"[NeoBridge] Failed to connect RPC: {e}")
+            return False
     
     async def disconnect(self) -> None:
         """Close connection to Neo N3 RPC node."""
-        # TODO: Implement connection cleanup
-        pass
+        if self._client is not None:
+            try:
+                await self._client.aclose()  # httpx.AsyncClient.close
+            finally:
+                self._client = None
     
     def is_connected(self) -> bool:
         """
         Check if connected to RPC node.
-        
-        Returns:
-            bool: True if connected
         """
         return self._client is not None
     
@@ -175,14 +178,11 @@ class NeoBridgeTool(BaseTool):
     
     async def get_block_height(self) -> int:
         """
-        Get the current blockchain height.
-        
-        Returns:
-            int: Current block height
+        Get current block height from the Neo node.
         """
-        # TODO: Implement block height query
-        # return await self._facade.get_block_count()
-        return 0
+        result = await self._rpc_call("getblockcount")
+        # Neo N3 通常返回整数
+        return int(result)
     
     async def get_transaction(self, tx_hash: str) -> Optional[dict]:
         """
@@ -223,47 +223,70 @@ class NeoBridgeTool(BaseTool):
         self,
         contract_hash: str,
         method: str,
-        params: list[Any] = None,
-        sign: bool = True
+        params: list[Any] | None = None,
+        sign: bool = True,
     ) -> TransactionResult:
         """
         Invoke a smart contract method.
-        
-        Args:
-            contract_hash: Contract script hash (hex string)
-            method: Method name to invoke
-            params: Method parameters
-            sign: Whether to sign and broadcast (False for read-only)
-            
-        Returns:
-            TransactionResult: Invocation result
+        当前实现仍然是 test invoke，只是把结果包装成 TransactionResult。
         """
-        # TODO: Implement contract invocation
-        # 1. Build invocation script
-        # 2. If sign=True, sign and broadcast
-        # 3. If sign=False, use test invoke
-        # 4. Return result
-        return TransactionResult(tx_hash="")
+        rpc_params = [contract_hash, method, params or []]
+        result = await self._rpc_call("invokefunction", rpc_params)
+
+        tx_hash = result.get("txid", "") or result.get("hash", "")
+        gas = float(result.get("gasconsumed", 0.0))
+        state = result.get("state", "HALT")
+        notifications = result.get("notifications", [])
+
+        return TransactionResult(
+            tx_hash=tx_hash,
+            gas_consumed=gas,
+            state=state,
+            notifications=notifications,
+        )
+
     
     async def test_invoke(
         self,
         contract_hash: str,
         method: str,
-        params: list[Any] = None
+        params: list[Any] | None = None,
     ) -> dict:
         """
-        Test invoke a contract method (read-only, no gas cost).
-        
-        Args:
-            contract_hash: Contract script hash
-            method: Method name
-            params: Method parameters
-            
-        Returns:
-            dict: Invocation result including stack and gas consumed
+        Perform a test invoke of a smart contract (read-only).
+        `params` 这里暂时假定已经是 Neo N3 RPC 期望的参数对象列表。
         """
-        # TODO: Implement test invocation
-        return {"stack": [], "gas_consumed": 0}
+        rpc_params = [contract_hash, method, params or []]
+        result = await self._rpc_call("invokefunction", rpc_params)
+        return result
+
+    async def _rpc_call(self, method: str, params: list[Any] | None = None) -> Any:
+        """
+        Internal helper to perform a JSON-RPC call to the Neo node.
+        """
+        if self._client is None:
+            # Lazy init HTTP client
+            self._client = httpx.AsyncClient(
+                base_url=self.config.rpc_url,
+                timeout=10.0,
+            )
+
+        payload = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params or [],
+            "id": 1,
+        }
+
+        resp = await self._client.post("", json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+
+        if "error" in data:
+            raise RuntimeError(f"Neo RPC error: {data['error']}")
+
+        return data.get("result")
+
     
     # =========================================================================
     # TOOL INTERFACE (SpoonOS)
@@ -271,28 +294,23 @@ class NeoBridgeTool(BaseTool):
     
     async def run(self, **kwargs: Any) -> ToolResult:
         """
-        SpoonOS tool execution entry point.
-        
-        This method is called by the SpoonOS framework when an agent
-        invokes this tool. It routes to the appropriate method based
-        on the 'action' parameter.
-        
-        Args:
-            action: The operation to perform
-            **kwargs: Action-specific parameters
-            
-        Returns:
-            ToolResult: Result of the operation
+        Dispatch method for SpoonOS.
         """
         action = kwargs.get("action", "")
-        
-        # TODO: Implement action routing
-        # if action == "connect":
-        #     return await self.connect()
-        # elif action == "invoke":
-        #     return await self.invoke_contract(**kwargs)
-        # elif action == "query":
-        #     return await self.test_invoke(**kwargs)
-        
-        return {"error": "Unknown action", "action": action}
 
+        if action == "connect":
+            ok = await self.connect()
+            return {"connected": ok}
+
+        if action == "block_height":
+            height = await self.get_block_height()
+            return {"block_height": height}
+
+        if action == "invokefunction":
+            return await self.test_invoke(
+                contract_hash=kwargs.get("contract_hash", ""),
+                method=kwargs.get("method", ""),
+                params=kwargs.get("params") or [],
+            )
+
+        return {"error": "Unknown action", "action": action}
