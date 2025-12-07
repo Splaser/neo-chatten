@@ -7,6 +7,7 @@ Compute Token DEX on Neo N3 blockchain.
 
 from typing import Any, Optional
 from dataclasses import dataclass, field
+from datetime import datetime
 
 # SpoonOS SDK imports
 # Note: These imports will show "could not be resolved" warnings in IDE
@@ -95,6 +96,7 @@ class ChattenTraderAgent(ToolCallAgent):
         self,
         name: str = "ChattenTrader",
         neo_wallet_address: Optional[str] = None,
+        tools: Optional[dict[str, Any]] = None,
         **kwargs: Any
     ) -> None:
         """
@@ -121,17 +123,27 @@ class ChattenTraderAgent(ToolCallAgent):
         self.neo_wallet_address = neo_wallet_address
         self.market_state = MarketState()
         self.position = TokenPosition()
+        self.tools: dict[str, Any] = {}
         
         # Initialize tools (to be registered)
-        self._register_tools()
+        self._register_tools(tools or {})
     
-    def _register_tools(self) -> None:
+    def _register_tools(self, tools: dict[str, Any]) -> None:
         """Register SpoonOS tools for blockchain interaction."""
-        # TODO: Import and register tools from tools/ module
-        # self.register_tool(TokenBalanceTool())
-        # self.register_tool(TokenTransferTool())
-        # self.register_tool(QScoreAnalyzerTool())
-        pass
+        for name, tool in tools.items():
+            self.add_tool(name, tool)
+
+    def add_tool(self, name: str, tool: Any) -> None:
+        """
+        Attach a tool to the agent and register with SpoonOS when available.
+        """
+        self.tools[name] = tool
+        if _SPOON_SDK_AVAILABLE:
+            try:
+                super().register_tool(tool)  # type: ignore[attr-defined]
+            except Exception:
+                # Development fallback when SDK is not present
+                pass
     
     # =========================================================================
     # TOKEN BALANCE OPERATIONS
@@ -156,12 +168,22 @@ class ChattenTraderAgent(ToolCallAgent):
             ConnectionError: If unable to connect to Neo N3 RPC node
             ValueError: If the token_id is invalid
         """
-        # TODO: Implement blockchain query via NeoBridgeTool
-        # 1. Connect to Neo N3 RPC node
-        # 2. Query NEP-11 contract for balance
-        # 3. Parse and return TokenPosition
+        balance_tool = self.tools.get("token_balance")
+        if balance_tool is None:
+            raise NotImplementedError("TokenBalanceTool is not configured")
         
-        raise NotImplementedError("Token balance check not yet implemented")
+        address = self.neo_wallet_address or ""
+        balance = await balance_tool.get_balance(address)
+        tokens = await balance_tool.get_tokens(address)
+        selected_token = token_id or (tokens[0] if tokens else "")
+        
+        self.position.token_id = selected_token
+        self.position.balance = float(balance)
+        self.position.available_amount = max(
+            0.0, self.position.balance - self.position.locked_amount
+        )
+        
+        return self.position
     
     async def get_all_balances(self) -> dict[str, TokenPosition]:
         """
@@ -170,8 +192,26 @@ class ChattenTraderAgent(ToolCallAgent):
         Returns:
             dict: Mapping of token_id to TokenPosition for all held tokens
         """
-        # TODO: Implement multi-token balance query
-        raise NotImplementedError("All balances query not yet implemented")
+        balance_tool = self.tools.get("token_balance")
+        if balance_tool is None:
+            raise NotImplementedError("TokenBalanceTool is not configured")
+        
+        address = self.neo_wallet_address or ""
+        token_ids = await balance_tool.get_tokens(address)
+        
+        positions: dict[str, TokenPosition] = {}
+        for t_id in token_ids:
+            info = await balance_tool.get_token_info(t_id)
+            balance = await balance_tool.get_balance(address)
+            pos = TokenPosition(
+                token_id=t_id,
+                balance=float(balance),
+                locked_amount=0.0,
+                available_amount=float(balance),
+            )
+            positions[t_id] = pos
+        
+        return positions
     
     # =========================================================================
     # MARKET QUALITY ANALYSIS (Q-SCORE)
@@ -205,13 +245,13 @@ class ChattenTraderAgent(ToolCallAgent):
             ValueError: If model_id is not registered on-chain
             TimeoutError: If performance data cannot be retrieved in time
         """
-        # TODO: Implement Q-score calculation
-        # 1. Fetch performance data from oracles or use provided metrics
-        # 2. Apply weighted scoring algorithm
-        # 3. Normalize to 0-100 scale
-        # 4. Update market_state with new Q-score
+        analyzer = self.tools.get("q_score_analyzer")
+        if analyzer is None:
+            raise NotImplementedError("QScoreAnalyzerTool is not configured")
         
-        raise NotImplementedError("Q-score analysis not yet implemented")
+        result = await analyzer.calculate_q_score(model_id)
+        self.market_state.current_q_score = result.q_score
+        return result.q_score
     
     async def get_market_q_scores(self) -> dict[str, float]:
         """
@@ -220,8 +260,23 @@ class ChattenTraderAgent(ToolCallAgent):
         Returns:
             dict: Mapping of model_id to their current Q-scores
         """
-        # TODO: Implement market-wide Q-score aggregation
-        raise NotImplementedError("Market Q-scores query not yet implemented")
+        analyzer = self.tools.get("q_score_analyzer")
+        if analyzer is None:
+            raise NotImplementedError("QScoreAnalyzerTool is not configured")
+        
+        # Use cached metrics if available; otherwise calculate a couple of demo IDs
+        model_ids = list(getattr(analyzer, "_metrics_cache", {}).keys()) or [
+            "model-alpha",
+            "model-beta",
+            "model-gamma",
+        ]
+        
+        scores = {}
+        for model_id in model_ids:
+            result = await analyzer.calculate_q_score(model_id)
+            scores[model_id] = result.q_score
+        
+        return scores
     
     async def compare_q_scores(
         self,
@@ -236,8 +291,15 @@ class ChattenTraderAgent(ToolCallAgent):
         Returns:
             list: Sorted list of (model_id, q_score, recommendation) tuples
         """
-        # TODO: Implement comparative Q-score analysis
-        raise NotImplementedError("Q-score comparison not yet implemented")
+        analyzer = self.tools.get("q_score_analyzer")
+        if analyzer is None:
+            raise NotImplementedError("QScoreAnalyzerTool is not configured")
+        
+        results = await analyzer.compare_models(model_ids)
+        return [
+            (r.model_id, r.q_score, r.recommendations[0] if r.recommendations else "")
+            for r in results
+        ]
     
     # =========================================================================
     # TRADING OPERATIONS
@@ -260,8 +322,30 @@ class ChattenTraderAgent(ToolCallAgent):
         Returns:
             dict: Transaction result including tx_hash and filled amount
         """
-        # TODO: Implement buy order execution
-        raise NotImplementedError("Buy order execution not yet implemented")
+        q_score = await self.analyze_q_score(token_id)
+        unit_price = max_price or self._price_from_q_score(q_score)
+        filled = float(amount)
+        
+        tx_result: dict[str, Any] = {}
+        transfer_tool = self.tools.get("token_transfer")
+        if transfer_tool:
+            tx_result = await transfer_tool.transfer(
+                self.neo_wallet_address or "",
+                token_id,
+                data=None
+            )
+        
+        self.market_state.last_trade_timestamp = datetime.utcnow().isoformat()
+        self.market_state.active_orders += 1
+        
+        return {
+            "action": "buy",
+            "token_id": token_id,
+            "filled": filled,
+            "unit_price": unit_price,
+            "spent": filled * unit_price,
+            "tx": tx_result or {"simulated": True},
+        }
     
     async def execute_sell_order(
         self,
@@ -280,8 +364,37 @@ class ChattenTraderAgent(ToolCallAgent):
         Returns:
             dict: Transaction result including tx_hash and filled amount
         """
-        # TODO: Implement sell order execution
-        raise NotImplementedError("Sell order execution not yet implemented")
+        q_score = await self.analyze_q_score(token_id)
+        unit_price = min_price or self._price_from_q_score(q_score)
+        filled = float(amount)
+        
+        tx_result: dict[str, Any] = {}
+        transfer_tool = self.tools.get("token_transfer")
+        if transfer_tool:
+            tx_result = await transfer_tool.transfer(
+                self.neo_wallet_address or "",
+                token_id,
+                data=None
+            )
+        
+        self.market_state.last_trade_timestamp = datetime.utcnow().isoformat()
+        self.market_state.active_orders += 1
+        
+        return {
+            "action": "sell",
+            "token_id": token_id,
+            "filled": filled,
+            "unit_price": unit_price,
+            "received": filled * unit_price,
+            "tx": tx_result or {"simulated": True},
+        }
+
+    def _price_from_q_score(self, q_score: float) -> float:
+        """
+        Simple pricing heuristic that rewards higher Q-scores with higher prices.
+        """
+        normalized = max(0.0, min(1.0, q_score / 100))
+        return round(0.1 + normalized * 0.9, 4)
     
     # =========================================================================
     # AGENT LIFECYCLE
@@ -289,16 +402,31 @@ class ChattenTraderAgent(ToolCallAgent):
     
     async def on_start(self) -> None:
         """Called when the agent starts. Initialize connections and state."""
-        # TODO: Initialize Neo N3 connection
-        # TODO: Load current market state
-        # TODO: Sync token positions
-        pass
+        neo_bridge = self.tools.get("neo_bridge")
+        if neo_bridge:
+            connected = await neo_bridge.connect()
+            if not connected:
+                raise ConnectionError("Unable to connect to Neo RPC node")
+        
+        # Prime market state with a sample Q-score
+        analyzer = self.tools.get("q_score_analyzer")
+        if analyzer:
+            result = await analyzer.calculate_q_score("model-alpha")
+            self.market_state.current_q_score = result.q_score
+        
+        # Sync balances for the configured wallet
+        if self.neo_wallet_address:
+            try:
+                await self.check_token_balance()
+            except Exception:
+                # Non-fatal during demo bootstrap
+                pass
     
     async def on_stop(self) -> None:
         """Called when the agent stops. Clean up resources."""
-        # TODO: Close connections gracefully
-        # TODO: Persist any cached state
-        pass
+        neo_bridge = self.tools.get("neo_bridge")
+        if neo_bridge and hasattr(neo_bridge, "disconnect"):
+            await neo_bridge.disconnect()
 
 
 # Convenience function for quick agent instantiation

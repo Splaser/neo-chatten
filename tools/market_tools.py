@@ -8,6 +8,8 @@ from typing import Any, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+import hashlib
+import random
 
 # SpoonOS SDK imports
 try:
@@ -128,6 +130,7 @@ class QScoreAnalyzerTool(BaseTool):
         """Initialize the Q-score Analyzer Tool."""
         super().__init__()
         self._metrics_cache: dict[str, PerformanceMetrics] = {}
+        self._recent_scores: dict[str, QScoreResult] = {}
     
     # =========================================================================
     # Q-SCORE CALCULATION
@@ -156,17 +159,14 @@ class QScoreAnalyzerTool(BaseTool):
         # 3. Apply weights and normalize
         # 4. Generate recommendations
         
-        # Placeholder implementation
         if metrics is None:
             metrics = await self._fetch_metrics(model_id)
         
-        # Calculate component scores (placeholder)
         latency_score = self._calculate_latency_score(metrics)
         throughput_score = self._calculate_throughput_score(metrics)
         quality_score = self._calculate_quality_score(metrics)
         reliability_score = self._calculate_reliability_score(metrics)
         
-        # Calculate composite Q-score
         q_score = (
             latency_score * self.LATENCY_WEIGHT +
             throughput_score * self.THROUGHPUT_WEIGHT +
@@ -174,16 +174,14 @@ class QScoreAnalyzerTool(BaseTool):
             reliability_score * self.RELIABILITY_WEIGHT
         ) * 100
         
-        # Determine mint eligibility
         mint_eligible = q_score >= self.MIN_SCORE_FOR_MINT
         
-        # Generate recommendations
         recommendations = self._generate_recommendations(
             q_score, latency_score, throughput_score,
             quality_score, reliability_score
         )
         
-        return QScoreResult(
+        result = QScoreResult(
             model_id=model_id,
             q_score=q_score,
             category=category,
@@ -195,6 +193,12 @@ class QScoreAnalyzerTool(BaseTool):
             recommendations=recommendations,
             mint_eligible=mint_eligible
         )
+        
+        # Cache for market-wide aggregation
+        self._metrics_cache[model_id] = metrics
+        self._recent_scores[model_id] = result
+        
+        return result
     
     async def compare_models(
         self,
@@ -224,8 +228,35 @@ class QScoreAnalyzerTool(BaseTool):
         Returns:
             MarketAnalysis: Overview of market quality metrics
         """
-        # TODO: Implement market analysis
-        return MarketAnalysis()
+        if not self._recent_scores:
+            return MarketAnalysis()
+        
+        scores = list(self._recent_scores.values())
+        total_models = len(scores)
+        avg_q_score = sum(r.q_score for r in scores) / total_models
+        
+        # Top performers by q_score
+        sorted_scores = sorted(scores, key=lambda r: r.q_score, reverse=True)
+        top_performers = [r.model_id for r in sorted_scores[:3]]
+        
+        # Simple pseudo-liquidity metric based on sample sizes
+        market_liquidity = sum(r.metrics.sample_size for r in scores)
+        
+        # Trend heuristic: classify based on average score
+        if avg_q_score >= self.EXCELLENT_THRESHOLD:
+            price_trend = "up"
+        elif avg_q_score >= self.GOOD_THRESHOLD:
+            price_trend = "stable"
+        else:
+            price_trend = "down"
+        
+        return MarketAnalysis(
+            total_models=total_models,
+            avg_q_score=round(avg_q_score, 2),
+            top_performers=top_performers,
+            market_liquidity=market_liquidity,
+            price_trend=price_trend,
+        )
     
     # =========================================================================
     # SCORE CALCULATION HELPERS
@@ -237,10 +268,21 @@ class QScoreAnalyzerTool(BaseTool):
         
         Lower latency = higher score.
         """
-        # TODO: Implement latency scoring
-        # Score based on average latency thresholds
-        # <50ms = 1.0, <100ms = 0.8, <200ms = 0.6, etc.
-        return 0.0
+        latency = metrics.avg_latency_ms or 0.0
+        p95 = metrics.p95_latency_ms or latency
+        
+        # Fast paths first
+        if latency <= 50 and p95 <= 100:
+            return 1.0
+        if latency <= 100 and p95 <= 200:
+            return 0.85
+        if latency <= 200 and p95 <= 400:
+            return 0.7
+        if latency <= 400 and p95 <= 800:
+            return 0.5
+        if latency <= 800 and p95 <= 1500:
+            return 0.35
+        return 0.2
     
     def _calculate_throughput_score(self, metrics: PerformanceMetrics) -> float:
         """
@@ -248,8 +290,21 @@ class QScoreAnalyzerTool(BaseTool):
         
         Higher throughput = higher score.
         """
-        # TODO: Implement throughput scoring
-        return 0.0
+        tps = metrics.tokens_per_second or 0.0
+        rpm = metrics.requests_per_minute or 0.0
+        
+        # Normalize tokens/second to a 0-1 scale with gentle curve
+        if tps >= 2000 or rpm >= 2000:
+            return 1.0
+        if tps >= 1000 or rpm >= 1000:
+            return 0.85
+        if tps >= 500 or rpm >= 500:
+            return 0.7
+        if tps >= 200 or rpm >= 200:
+            return 0.5
+        if tps >= 50 or rpm >= 50:
+            return 0.35
+        return 0.2
     
     def _calculate_quality_score(self, metrics: PerformanceMetrics) -> float:
         """
@@ -257,8 +312,12 @@ class QScoreAnalyzerTool(BaseTool):
         
         Based on accuracy and benchmark performance.
         """
-        # TODO: Implement quality scoring
-        return 0.0
+        # Simple average of accuracy & benchmark, both expected on 0-1 scale
+        accuracy = metrics.accuracy_score or 0.0
+        benchmark = metrics.benchmark_score or accuracy
+        
+        raw = (accuracy + benchmark) / 2
+        return self._clamp(raw, 0.0, 1.0)
     
     def _calculate_reliability_score(self, metrics: PerformanceMetrics) -> float:
         """
@@ -266,8 +325,19 @@ class QScoreAnalyzerTool(BaseTool):
         
         Based on uptime and error rates.
         """
-        # TODO: Implement reliability scoring
-        return 0.0
+        uptime = metrics.uptime_percentage / 100 if metrics.uptime_percentage else 0.0
+        error_rate = metrics.error_rate or 0.0
+        
+        if error_rate < 0:
+            error_rate = 0.0
+        
+        # Reliability rewards high uptime and low error rate
+        reliability = uptime * 0.9 + (1 - min(error_rate, 1.0)) * 0.1
+        return self._clamp(reliability, 0.0, 1.0)
+
+    def _clamp(self, value: float, min_value: float = 0.0, max_value: float = 1.0) -> float:
+        """Clamp a value between bounds."""
+        return max(min_value, min(max_value, value))
     
     def _generate_recommendations(
         self,
@@ -310,15 +380,32 @@ class QScoreAnalyzerTool(BaseTool):
         Returns:
             PerformanceMetrics: Current metrics
         """
-        # TODO: Implement oracle integration
-        # Check cache first
+        # In a real deployment this would query an oracle. For the demo we
+        # generate deterministic pseudo-metrics so the numbers are stable
+        # between runs without needing network access.
         if model_id in self._metrics_cache:
             return self._metrics_cache[model_id]
         
-        # Fetch from oracle
-        # ...
+        seed = int.from_bytes(hashlib.sha256(model_id.encode()).digest()[:8], "big")
+        rng = random.Random(seed)
         
-        return PerformanceMetrics()
+        metrics = PerformanceMetrics(
+            avg_latency_ms=round(60 + rng.random() * 500, 2),
+            p95_latency_ms=round(100 + rng.random() * 600, 2),
+            p99_latency_ms=round(150 + rng.random() * 800, 2),
+            tokens_per_second=round(50 + rng.random() * 2500, 2),
+            requests_per_minute=round(30 + rng.random() * 2500, 2),
+            accuracy_score=round(0.65 + rng.random() * 0.3, 3),
+            benchmark_score=round(0.6 + rng.random() * 0.35, 3),
+            uptime_percentage=round(96 + rng.random() * 4, 3),
+            error_rate=round(rng.random() * 0.05, 4),
+            cost_per_1k_tokens=round(0.0005 + rng.random() * 0.002, 6),
+            measurement_timestamp=datetime.utcnow(),
+            sample_size=rng.randint(100, 1000),
+        )
+        
+        self._metrics_cache[model_id] = metrics
+        return metrics
     
     # =========================================================================
     # TOOL INTERFACE (SpoonOS)
