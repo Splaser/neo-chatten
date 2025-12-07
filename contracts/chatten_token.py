@@ -122,7 +122,11 @@ def get_current_price(model_id: bytes) -> int:
 
 @public
 def update_price_oracle(model_id: bytes, price_gas: int) -> bool:
-    """Update price. Oracle only."""
+    """
+    Called by SpoonOS Agent to update prices based on Demand/Quality.
+    """
+    
+    #Update price. Oracle only.
     assert _not_paused(), "Paused"
     assert len(model_id) > 0, "Invalid"
     assert price_gas > 0, "Invalid"
@@ -131,7 +135,7 @@ def update_price_oracle(model_id: bytes, price_gas: int) -> bool:
     token_id = CryptoLib.sha256(model_id)
     put_int(PREFIX_PRICE + token_id, price_gas)
     return True
-
+    
 
 @public(safe=True)
 def get_gas_reserve() -> int:
